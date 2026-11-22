@@ -1,3 +1,5 @@
+![MIMESIS VR](docs/images/banner.png)
+
 # MIMESIS VR (beta)
 
 An unofficial VR mod for [MIMESIS](https://store.steampowered.com/app/2827200/MIMESIS/) with full motion controller support: your character's own arms follow your hands, melee weapons are swung with your arm, the inventory and the health readout are on your wrists.
