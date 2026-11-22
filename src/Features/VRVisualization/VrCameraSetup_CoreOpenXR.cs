@@ -1,10 +1,11 @@
-﻿using System.Runtime.InteropServices;
+using System.Runtime.InteropServices;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using UnityVRMod.Config;
 using UnityVRMod.Core;
 using UnityVRMod.Features.Util;
 using UnityVRMod.Features.VRVisualization.OpenXR;
+using UnityVRMod.Mimesis;
 
 namespace UnityVRMod.Features.VrVisualization
 {
@@ -106,6 +107,7 @@ namespace UnityVRMod.Features.VrVisualization
                     throw new Exception("Failed to get D3D11 device pointer.");
 
                 NativeBridge.SetDevicePointerFromCSharp(_d3d11Device);
+                RtSubmit.Init(_d3d11Device, _xrInstance);
 
                 var systemGetInfo = new XrSystemGetInfo { type = XrStructureType.XR_TYPE_SYSTEM_GET_INFO, formFactor = XrFormFactor.XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY };
                 OpenXRHelper.CheckResult(OpenXRAPI.xrGetSystem(_xrInstance, in systemGetInfo, out _xrSystemId), "xrGetSystem");
@@ -130,6 +132,9 @@ namespace UnityVRMod.Features.VrVisualization
                 _isSessionRunning = true;
                 VRModCore.Log("OpenXR Session begun.");
 
+                _controllers = new XrControllerInput();
+                if (_controllers.Initialize(_xrInstance, _xrSession)) MimesisInput.Controllers = _controllers;
+
                 var refSpaceCreateInfo = new XrReferenceSpaceCreateInfo { type = XrStructureType.XR_TYPE_REFERENCE_SPACE_CREATE_INFO, referenceSpaceType = XrReferenceSpaceType.XR_REFERENCE_SPACE_TYPE_STAGE, poseInReferenceSpace = new XrPosef { orientation = new XrQuaternionf { w = 1f } } };
                 if (OpenXRAPI.xrCreateReferenceSpace(_xrSession, in refSpaceCreateInfo, out _appSpace) < 0)
                 {
@@ -153,7 +158,7 @@ namespace UnityVRMod.Features.VrVisualization
                     _pProjectionLayerViews = Marshal.AllocHGlobal(Marshal.SizeOf<XrCompositionLayerProjectionView>() * _viewConfigViews.Count);
                     _projectionLayer = new XrCompositionLayerProjection { type = XrStructureType.XR_TYPE_COMPOSITION_LAYER_PROJECTION };
                     _pProjectionLayer = Marshal.AllocHGlobal(Marshal.SizeOf<XrCompositionLayerProjection>());
-                    _pLayersForSubmit = Marshal.AllocHGlobal(Marshal.SizeOf<IntPtr>() * 1);
+                    _pLayersForSubmit = Marshal.AllocHGlobal(Marshal.SizeOf<IntPtr>() * 12);
                     Marshal.WriteIntPtr(_pLayersForSubmit, _pProjectionLayer);
                 }
 
@@ -291,6 +296,7 @@ namespace UnityVRMod.Features.VrVisualization
                     if (pollResult < 0) { IsVrAvailable = false; break; }
 
                     var actualEventType = (XrStructureType)Marshal.ReadInt32(eventBufferPtr);
+                    if ((int)actualEventType == 40) { VRModCore.Log("[MimesisVR] Reference space change (system recenter) -> recentering."); RequestRecenter(); }
                     if (actualEventType == XrStructureType.XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
                     {
                         var stateEvent = Marshal.PtrToStructure<XrEventDataSessionStateChanged>(eventBufferPtr);
@@ -310,6 +316,8 @@ namespace UnityVRMod.Features.VrVisualization
                                     if (_isSessionRunning)
                                     {
                                         VRModCore.Log("Session is stopping, calling xrEndSession.");
+                                        RtSubmit.WaitPrevious(500);
+                                        RtSubmit.ResetFrame();
                                         OpenXRAPI.xrEndSession(_xrSession);
                                         _isSessionRunning = false;
                                     }
@@ -334,22 +342,42 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (!_isSessionRunning) return;
 
-            var frameWaitInfo = new XrFrameWaitInfo { type = XrStructureType.XR_TYPE_FRAME_WAIT_INFO };
-            _xrFrameState.type = XrStructureType.XR_TYPE_FRAME_STATE;
-            OpenXRAPI.xrWaitFrame(_xrSession, in frameWaitInfo, out _xrFrameState);
-
-            var frameBeginInfo = new XrFrameBeginInfo { type = XrStructureType.XR_TYPE_FRAME_BEGIN_INFO };
-            if (OpenXRAPI.xrBeginFrame(_xrSession, in frameBeginInfo) == XrResult.XR_FRAME_DISCARDED)
+            MimesisWatchdog.Start();
+            MimesisWatchdog.Armed = true;
+            MimesisWatchdog.MainStage = 1;
+            var perfSw = System.Diagnostics.Stopwatch.StartNew();
+            RtSubmit.WaitPrevious();
+            if (!RtSubmit.ReadyForNextFrame) return;
+            MimesisWatchdog.MainStage = 2;
+            if (RtSubmit.NativeActive)
             {
-                var discardedFrameEndInfo = new XrFrameEndInfo { type = XrStructureType.XR_TYPE_FRAME_END_INFO, displayTime = _xrFrameState.predictedDisplayTime, layerCount = 0, layers = IntPtr.Zero, environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE };
-                OpenXRAPI.xrEndFrame(_xrSession, in discardedFrameEndInfo);
-                return;
+                // xrWaitFrame/xrBeginFrame run on the render thread right after the previous xrEndFrame,
+                // so the main thread never calls into the runtime's D3D11 code while Unity renders.
+                if (!RtSubmit.FrameBegun) { RtSubmit.SubmitBootstrap(_xrSession); return; }
+                _xrFrameState = RtSubmit.LastFrameState;
+                MimesisWatchdog.MainStage = 3;
+            }
+            else
+            {
+                var frameWaitInfo = new XrFrameWaitInfo { type = XrStructureType.XR_TYPE_FRAME_WAIT_INFO };
+                _xrFrameState.type = XrStructureType.XR_TYPE_FRAME_STATE;
+                OpenXRAPI.xrWaitFrame(_xrSession, in frameWaitInfo, out _xrFrameState);
+
+                MimesisWatchdog.MainStage = 3;
+                var frameBeginInfo = new XrFrameBeginInfo { type = XrStructureType.XR_TYPE_FRAME_BEGIN_INFO };
+                if (OpenXRAPI.xrBeginFrame(_xrSession, in frameBeginInfo) == XrResult.XR_FRAME_DISCARDED)
+                {
+                    var discardedFrameEndInfo = new XrFrameEndInfo { type = XrStructureType.XR_TYPE_FRAME_END_INFO, displayTime = _xrFrameState.predictedDisplayTime, layerCount = 0, layers = IntPtr.Zero, environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE };
+                    OpenXRAPI.xrEndFrame(_xrSession, in discardedFrameEndInfo);
+                    return;
+                }
             }
 
             var frameEndInfo = new XrFrameEndInfo { type = XrStructureType.XR_TYPE_FRAME_END_INFO, displayTime = _xrFrameState.predictedDisplayTime, environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE, layerCount = 0, layers = IntPtr.Zero };
 
             if (_xrFrameState.shouldRender == XrBool32.XR_TRUE)
             {
+                MimesisWatchdog.MainStage = 4;
                 var viewLocateInfo = new XrViewLocateInfo { type = XrStructureType.XR_TYPE_VIEW_LOCATE_INFO, viewConfigurationType = _viewConfigType, displayTime = _xrFrameState.predictedDisplayTime, space = _appSpace };
                 _locatedViewState.type = XrStructureType.XR_TYPE_VIEW_STATE;
 
@@ -363,41 +391,89 @@ namespace UnityVRMod.Features.VrVisualization
                 finally { Marshal.FreeHGlobal(pLocatedViews); }
 
                 bool poseIsValid = (_locatedViewState.viewStateFlags & XrViewStateFlags.XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+                if (_controllers != null && _controllers.Ready && _currentSessionState == XrSessionState.XR_SESSION_STATE_FOCUSED)
+                    _controllers.Update(_appSpace, _xrFrameState.predictedDisplayTime);
+                if (poseIsValid) FollowGameCamera();
+                MimesisWatchdog.MainStage = 5;
+                MimesisVrExtras.BeforeEyeRender(this);
+                MimesisPerf.TPre = (float)perfSw.Elapsed.TotalMilliseconds;
 
                 if (poseIsValid)
                 {
-                    var acquireInfo = new XrSwapchainImageAcquireInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-                    OpenXRAPI.xrAcquireSwapchainImage(_eyeSwapchains[0], in acquireInfo, out uint acquiredIdx0);
-                    OpenXRAPI.xrAcquireSwapchainImage(_eyeSwapchains[1], in acquireInfo, out uint acquiredIdx1);
+                    uint acquiredIdx0 = 0, acquiredIdx1 = 0;
+                    if (!RtSubmit.NativeActive)
+                    {
+                        var acquireInfo = new XrSwapchainImageAcquireInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+                        OpenXRAPI.xrAcquireSwapchainImage(_eyeSwapchains[0], in acquireInfo, out acquiredIdx0);
+                        OpenXRAPI.xrAcquireSwapchainImage(_eyeSwapchains[1], in acquireInfo, out acquiredIdx1);
 
-                    var waitInfo = new XrSwapchainImageWaitInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, timeout = OpenXRConstants.XR_INFINITE_DURATION };
-                    OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[0], in waitInfo);
-                    OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[1], in waitInfo);
+                        var waitInfo = new XrSwapchainImageWaitInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, timeout = OpenXRConstants.XR_INFINITE_DURATION };
+                        OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[0], in waitInfo);
+                        OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[1], in waitInfo);
+                    }
 
-                    RenderEye(0, acquiredIdx0);
-                    RenderEye(1, acquiredIdx1);
+                    MimesisVrExtras.PreEyes(_leftVrCamera, _rightVrCamera);
+                    try
+                    {
+                        MimesisWatchdog.MainStage = 6;
+                        RenderEye(0, acquiredIdx0);
+                        MimesisPerf.TLeft = (float)perfSw.Elapsed.TotalMilliseconds;
+                        MimesisWatchdog.MainStage = 7;
+                        RenderEye(1, acquiredIdx1);
+                        MimesisPerf.TRight = (float)perfSw.Elapsed.TotalMilliseconds;
+                    }
+                    finally { MimesisVrExtras.PostEyes(); }
 
-                    var releaseInfo = new XrSwapchainImageReleaseInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-                    OpenXRAPI.xrReleaseSwapchainImage(_eyeSwapchains[0], in releaseInfo);
-                    OpenXRAPI.xrReleaseSwapchainImage(_eyeSwapchains[1], in releaseInfo);
+                    RtSubmit.AddRelease(_eyeSwapchains[0]);
+                    RtSubmit.AddRelease(_eyeSwapchains[1]);
 
                     PopulateProjectionLayer();
                     frameEndInfo.layerCount = 1;
                     frameEndInfo.layers = _pLayersForSubmit;
+                    MimesisWatchdog.MainStage = 8;
+                    frameEndInfo.layerCount = SubmitQuadLayers();
+                    // build 45: after the layers, so the monitor can show them too (stream)
+                    bool mirrorRight = MimesisVrExtras.MirrorRightEye && _rightEyeIntermediateRT != null && _rightVrCamera != null; // build 45: right eye by default
+                    MimesisVrExtras.MirrorToScreen(mirrorRight ? _rightEyeIntermediateRT : _leftEyeIntermediateRT, mirrorRight ? _rightVrCamera : _leftVrCamera, _vrRig != null ? _vrRig.transform : null);
                 }
             }
 
-            OpenXRAPI.xrEndFrame(_xrSession, in frameEndInfo);
+            MimesisWatchdog.MainStage = 9;
+            RtSubmit.Submit(_xrSession, frameEndInfo);
+            MimesisWatchdog.MainStage = 10;
+            MimesisWatchdog.Frames++;
+            MimesisPerf.FrameDone((float)perfSw.Elapsed.TotalMilliseconds, _xrFrameState.predictedDisplayPeriod);
         }
 
         private void RenderEye(int eyeIndex, uint swapchainImageIndex)
         {
             Camera currentEyeCamera = (eyeIndex == 0) ? _leftVrCamera : _rightVrCamera;
+            // MIMESIS VR: draw distance and post-processing options (CPU/GPU savers)
+            {
+                float baseFar = _refFar;
+                if (baseFar <= 0f && MimesisInput.GameCamera != null && MimesisInput.GameCamera.TryGetComponent<Camera>(out var gcam)) baseFar = gcam.farClipPlane;
+                if (baseFar > 0f)
+                {
+                    float far = MimesisImage.DrawDistance > 0f ? Mathf.Min(baseFar, MimesisImage.DrawDistance) : baseFar;
+                    far = Mathf.Max(currentEyeCamera.nearClipPlane * 20f, far);
+                    if (!Mathf.Approximately(currentEyeCamera.farClipPlane, far))
+                    {
+                        currentEyeCamera.farClipPlane = far;
+                        if (eyeIndex == 0) VRModCore.Log($"[MimesisVR] Eye far clip {far:F0} m (game {baseFar:F0} m)");
+                    }
+                }
+            }
+            var eyeData = UnityEngine.Rendering.Universal.CameraExtensions.GetUniversalAdditionalCameraData(currentEyeCamera);
+            if (eyeData != null) { bool post = _gamePost && MimesisImage.EyePost; if (eyeData.renderPostProcessing != post) eyeData.renderPostProcessing = post; }
             RenderTexture currentIntermediateRT = (eyeIndex == 0) ? _leftEyeIntermediateRT : _rightEyeIntermediateRT;
             IntPtr nativeTextureResourcePtr = _eyeSwapchainImages[eyeIndex][(int)swapchainImageIndex];
             XrViewConfigurationView viewConfig = _viewConfigViews[eyeIndex];
 
-            bool rtNeedsRecreation = (currentIntermediateRT == null || !currentIntermediateRT.IsCreated() || currentIntermediateRT.width != (int)viewConfig.recommendedImageRectWidth || currentIntermediateRT.height != (int)viewConfig.recommendedImageRectHeight);
+            int wantMsaa = MimesisVrExtras.LegacyFlip ? 1 : MimesisVrExtras.MsaaSamples;
+            float rs = MimesisVrExtras.LegacyFlip ? 1f : Mathf.Clamp(MimesisImage.RenderScale, 0.4f, 1f);
+            int fullW = (int)viewConfig.recommendedImageRectWidth, fullH = (int)viewConfig.recommendedImageRectHeight;
+            int wantW = Mathf.Max(64, Mathf.RoundToInt(fullW * rs)), wantH = Mathf.Max(64, Mathf.RoundToInt(fullH * rs));
+            bool rtNeedsRecreation = (currentIntermediateRT == null || !currentIntermediateRT.IsCreated() || currentIntermediateRT.width != wantW || currentIntermediateRT.height != wantH || currentIntermediateRT.antiAliasing != wantMsaa);
             if (rtNeedsRecreation)
             {
                 if (currentIntermediateRT != null) { currentIntermediateRT.Release(); UnityEngine.Object.Destroy(currentIntermediateRT); }
@@ -407,7 +483,9 @@ namespace UnityVRMod.Features.VrVisualization
                     : GraphicsFormat.B8G8R8A8_UNorm;
 
                 VRModCore.LogSpammyDebug($"Creating intermediate RenderTexture with format: {renderTextureFormat}");
-                currentIntermediateRT = new RenderTexture((int)viewConfig.recommendedImageRectWidth, (int)viewConfig.recommendedImageRectHeight, 24, renderTextureFormat);
+                currentIntermediateRT = new RenderTexture(wantW, wantH, 24, renderTextureFormat);
+                currentIntermediateRT.antiAliasing = wantMsaa;
+                VRModCore.Log($"[MimesisVR] Eye {eyeIndex} RT {currentIntermediateRT.width}x{currentIntermediateRT.height}, MSAA x{wantMsaa}");
 
                 if (eyeIndex == 0) _leftEyeIntermediateRT = currentIntermediateRT; else _rightEyeIntermediateRT = currentIntermediateRT;
             }
@@ -415,7 +493,8 @@ namespace UnityVRMod.Features.VrVisualization
             currentEyeCamera.targetTexture = currentIntermediateRT;
             currentEyeCamera.clearFlags = _mainCameraClearFlags;
             if (_mainCameraClearFlags == CameraClearFlags.SolidColor) { currentEyeCamera.backgroundColor = _mainCameraBackgroundColor; }
-            currentEyeCamera.cullingMask = _mainCameraCullingMask;
+            if (MimesisVrExtras.MenuBackdrop) { currentEyeCamera.clearFlags = CameraClearFlags.SolidColor; currentEyeCamera.backgroundColor = new Color(0.035f, 0.035f, 0.045f, 1f); }
+            currentEyeCamera.cullingMask = _mainCameraCullingMask | MimesisVrExtras.VrOnlyLayerMask;
             currentEyeCamera.enabled = true;
 
             XrPosef eyePose = _locatedViews[eyeIndex].pose;
@@ -429,22 +508,46 @@ namespace UnityVRMod.Features.VrVisualization
 #endif
 
             Matrix4x4 projM = CreateProjectionMatrixFromFovUsingFrustum(_locatedViews[eyeIndex].fov, currentEyeCamera.nearClipPlane, currentEyeCamera.farClipPlane);
-            projM = Matrix4x4.Scale(new Vector3(1, -1, 1)) * projM;
+            bool legacyFlip = MimesisVrExtras.LegacyFlip;
+            if (legacyFlip) projM = Matrix4x4.Scale(new Vector3(1, -1, 1)) * projM;
             currentEyeCamera.projectionMatrix = projM;
 
             bool originalInvertCulling = GL.invertCulling;
-            GL.invertCulling = true;
+            if (legacyFlip) GL.invertCulling = true;
             currentEyeCamera.Render();
             GL.invertCulling = originalInvertCulling;
+            if (!legacyFlip)
+            {
+                var fov = _locatedViews[eyeIndex].fov;
+                MimesisHud.CompositeFx(currentIntermediateRT, fov.angleLeft, fov.angleRight, fov.angleUp, fov.angleDown);
+                MimesisWatches.CompositeDamage(currentIntermediateRT);
+            }
+
+            RenderTexture sourceRT = currentIntermediateRT;
+            if (!legacyFlip && currentIntermediateRT != null)
+            {
+                RenderTexture flipRT = (eyeIndex == 0) ? _leftFlipRT : _rightFlipRT;
+                // Always the swapchain size: a lower render scale is stretched up by this blit
+                if (flipRT == null || flipRT.width != fullW || flipRT.height != fullH)
+                {
+                    if (flipRT != null) { flipRT.Release(); UnityEngine.Object.Destroy(flipRT); }
+                    flipRT = new RenderTexture(fullW, fullH, 0, currentIntermediateRT.graphicsFormat);
+                    flipRT.Create();
+                    if (eyeIndex == 0) _leftFlipRT = flipRT; else _rightFlipRT = flipRT;
+                }
+                Graphics.Blit(currentIntermediateRT, flipRT, new Vector2(1f, -1f), new Vector2(0f, 1f));
+                sourceRT = flipRT;
+            }
             Graphics.ExecuteCommandBuffer(_flushCommandBuffer);
             RenderTexture.active = null;
 
-            if (currentIntermediateRT != null && currentIntermediateRT.IsCreated())
+            if (sourceRT != null && sourceRT.IsCreated())
             {
-                IntPtr sourceNativePtr = currentIntermediateRT.GetNativeTexturePtr();
-                if (sourceNativePtr != IntPtr.Zero && nativeTextureResourcePtr != IntPtr.Zero)
+                IntPtr sourceNativePtr = sourceRT.GetNativeTexturePtr();
+                if (sourceNativePtr != IntPtr.Zero && (RtSubmit.NativeActive || nativeTextureResourcePtr != IntPtr.Zero))
                 {
-                    NativeBridge.DirectCopyResource_Internal(nativeTextureResourcePtr, sourceNativePtr);
+                    if (RtSubmit.NativeActive) RtSubmit.AddSwapchainCopy(_eyeSwapchains[eyeIndex], _eyeSwapchainImages[eyeIndex], sourceNativePtr);
+                    else RtSubmit.AddCopy(nativeTextureResourcePtr, sourceNativePtr);
                 }
             }
         }
@@ -469,8 +572,155 @@ namespace UnityVRMod.Features.VrVisualization
             Marshal.StructureToPtr(_projectionLayer, _pProjectionLayer, false);
         }
 
+        // ---- MIMESIS VR: rig follows the game camera ----
+        private XrControllerInput _controllers;
+        private RenderTexture _leftFlipRT, _rightFlipRT;
+        public XrControllerInput Controllers => _controllers;
+        public Transform RigTransform => _vrRig != null ? _vrRig.transform : null;
+        private bool _hasRecenter;
+        private Vector3 _recenterHeadLocal;
+        private float _recenterYaw;
+
+        public void RequestRecenter() { _hasRecenter = false; MimesisVrExtras.RequestPanelReplace(); }
+
+        // ---- MIMESIS VR: menu panel and HUD as OpenXR quad layers ----
+        private XrQuadLayer _panelLayer, _hudLayer, _laserLayer, _gearLayer, _settingsLayer, _fpsLayer, _watchLayer;
+        private readonly Dictionary<string, XrQuadLayer> _segLayers = new();
+
+        /// <summary>Appends quad layers after the projection layer. Returns total layer count.</summary>
+        private uint SubmitQuadLayers()
+        {
+            if (_pLayersForSubmit == IntPtr.Zero) return 1;
+            _panelLayer ??= new XrQuadLayer("Panel");
+            _hudLayer ??= new XrQuadLayer("HUD");
+            int count = 1;
+            MimesisStream.BeginFrame();
+            if (MimesisVrExtras.PanelLayerActive)
+            {
+                if (_panelLayer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, MimesisVrExtras.PanelOutput, MimesisVrExtras.PanelLocalPos, MimesisVrExtras.PanelLocalRot, MimesisVrExtras.PanelSize, MimesisVrExtras.PanelLayerFlags))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, _panelLayer.LayerPtr); count++; }
+                else if (_panelLayer.Failed) MimesisVrExtras.QuadLayerUnavailable = true;
+            }
+            if (MimesisHud.Active)
+            {
+                if (_hudLayer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, MimesisHud.Output, MimesisHud.LocalPos, MimesisHud.LocalRot, MimesisHud.Size, XrQuadLayer.FLAG_BLEND_SOURCE_ALPHA))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, _hudLayer.LayerPtr); count++; }
+            }
+            foreach (var seg in MimesisHudSegments.All)
+            {
+                if (!seg.Active || seg.Tex == null) continue;
+                if (!_segLayers.TryGetValue(seg.Name, out var layer)) { layer = new XrQuadLayer("HUD-" + seg.Name); _segLayers[seg.Name] = layer; }
+                var segTex = seg.DrawTex != null ? seg.DrawTex : seg.Tex;
+                int segW = seg.DrawTex != null ? seg.DrawW : seg.W, segH = seg.DrawTex != null ? seg.DrawH : seg.H;
+                if (count < 9 && layer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, segTex, seg.LocalPos, seg.LocalRot, seg.Size, XrQuadLayer.FLAG_BLEND_SOURCE_ALPHA, segW, segH))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, layer.LayerPtr); count++; MimesisStream.Add(segTex, seg.LocalPos, seg.LocalRot, seg.Size, segW, segH); }
+            }
+            if (MimesisWatches.ScreenActive && count < 10)
+            {
+                _watchLayer ??= new XrQuadLayer("WatchR");
+                if (_watchLayer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, MimesisWatches.ScreenTex, MimesisWatches.ScreenPos, MimesisWatches.ScreenRot, MimesisWatches.ScreenSize, XrQuadLayer.FLAG_BLEND_SOURCE_ALPHA))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, _watchLayer.LayerPtr); count++; MimesisStream.Add(MimesisWatches.ScreenTex, MimesisWatches.ScreenPos, MimesisWatches.ScreenRot, MimesisWatches.ScreenSize); }
+            }
+            if (MimesisSettingsUI.GearActive && count < 11)
+            {
+                _gearLayer ??= new XrQuadLayer("Gear");
+                if (_gearLayer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, MimesisSettingsUI.GearTex, MimesisSettingsUI.GearLocalPos, MimesisSettingsUI.GearLocalRot, MimesisSettingsUI.GearSize, XrQuadLayer.FLAG_BLEND_SOURCE_ALPHA))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, _gearLayer.LayerPtr); count++; MimesisStream.Add(MimesisSettingsUI.GearTex, MimesisSettingsUI.GearLocalPos, MimesisSettingsUI.GearLocalRot, MimesisSettingsUI.GearSize); }
+            }
+            if (MimesisSettingsUI.PanelActive && count < 11)
+            {
+                _settingsLayer ??= new XrQuadLayer("Settings");
+                if (_settingsLayer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, MimesisSettingsUI.PanelTex, MimesisSettingsUI.PanelLocalPos, MimesisSettingsUI.PanelLocalRot, MimesisSettingsUI.PanelSize, XrQuadLayer.FLAG_BLEND_SOURCE_ALPHA))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, _settingsLayer.LayerPtr); count++; MimesisStream.Add(MimesisSettingsUI.PanelTex, MimesisSettingsUI.PanelLocalPos, MimesisSettingsUI.PanelLocalRot, MimesisSettingsUI.PanelSize); }
+            }
+            if (MimesisFps.Active && count < 11)
+            {
+                _fpsLayer ??= new XrQuadLayer("Fps");
+                if (_fpsLayer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, MimesisFps.Tex, MimesisFps.LocalPos, MimesisFps.LocalRot, MimesisFps.Size, XrQuadLayer.FLAG_BLEND_SOURCE_ALPHA))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, _fpsLayer.LayerPtr); count++; MimesisStream.Add(MimesisFps.Tex, MimesisFps.LocalPos, MimesisFps.LocalRot, MimesisFps.Size); }
+            }
+            if (MimesisVrExtras.LaserLayerActive && count < 12)
+            {
+                _laserLayer ??= new XrQuadLayer("Laser");
+                if (_laserLayer.Submit(_xrSession, _appSpace, _selectedSwapchainFormat, MimesisVrExtras.LaserTex, MimesisVrExtras.LaserLocalPos, MimesisVrExtras.LaserLocalRot, MimesisVrExtras.LaserSize, XrQuadLayer.FLAG_BLEND_SOURCE_ALPHA))
+                { Marshal.WriteIntPtr(_pLayersForSubmit + IntPtr.Size * count, _laserLayer.LayerPtr); count++; MimesisStream.Add(MimesisVrExtras.LaserTex, MimesisVrExtras.LaserLocalPos, MimesisVrExtras.LaserLocalRot, MimesisVrExtras.LaserSize); }
+            }
+            return (uint)count;
+        }
+
+        /// <summary>Re-place the rig on the game camera now (used before rendering so the character arms match).</summary>
+        public void RefollowNow()
+        {
+            try { if (_vrRig != null && _isSessionRunning) FollowGameCamera(); } catch { }
+        }
+
+        private void FollowGameCamera()
+        {
+            if (_vrRig == null || _currentlyTrackedOriginalCameraGO == null) return;
+            Transform anchor = _currentlyTrackedOriginalCameraGO.transform;
+
+            var p0 = _locatedViews[0].pose; var p1 = _locatedViews[1].pose;
+            Vector3 head = (new Vector3(p0.position.x, p0.position.y, -p0.position.z) + new Vector3(p1.position.x, p1.position.y, -p1.position.z)) * 0.5f;
+            Quaternion headRot = new(p0.orientation.x, p0.orientation.y, -p0.orientation.z, -p0.orientation.w);
+
+            if (!_hasRecenter && head.sqrMagnitude > 1e-6f)
+            {
+                _recenterHeadLocal = head;
+                _recenterYaw = headRot.eulerAngles.y;
+                _hasRecenter = true;
+                MimesisInput.RigYaw = anchor.eulerAngles.y - _recenterYaw;
+                MimesisInput.RigYawInitialized = true;
+                VRModCore.Log($"[MimesisVR] Recentered. Head local pos {head}, yaw {_recenterYaw:F1}. Anchor '{anchor.name}' at {anchor.position}.");
+            }
+
+            float s = _currentAppliedRigScale;
+            Quaternion rigRot = Quaternion.Euler(0f, MimesisInput.RigYaw, 0f);
+            if (_hasRecenter) MimesisRoomScale.Step(anchor, rigRot, s, ref _recenterHeadLocal, head);
+            MimesisInput.HeadWorldRot = rigRot * headRot;
+            MimesisInput.GameCamera = anchor;
+            MimesisInput.HeadLocalPos = head;
+            MimesisInput.HeadLocalRot = headRot;
+            MimesisInput.HeadValid = true;
+            MimesisInput.VrActive = true;
+            Vector3 pos = anchor.position - rigRot * (_recenterHeadLocal * s);
+            pos.y += (ConfigManager.VrUserEyeHeightOffset.Value + MimesisSettings.HeightOffset) * s;
+            pos += MimesisHands.EmoteCamOffset; // build 45: emotes that move the body - the view follows the head sideways
+            _vrRig.transform.SetPositionAndRotation(pos, rigRot);
+        }
+
+        private static void CopyUrpCameraData(Camera src, Camera dst)
+        {
+            try
+            {
+                var s = UnityEngine.Rendering.Universal.CameraExtensions.GetUniversalAdditionalCameraData(src);
+                var d = UnityEngine.Rendering.Universal.CameraExtensions.GetUniversalAdditionalCameraData(dst);
+                if (s == null || d == null) { VRModCore.LogWarning("[MimesisVR] No URP camera data to copy."); return; }
+                d.renderPostProcessing = s.renderPostProcessing;
+                _gamePost = s.renderPostProcessing;
+                d.antialiasing = s.antialiasing;
+                d.antialiasingQuality = s.antialiasingQuality;
+                d.renderShadows = s.renderShadows;
+                d.volumeLayerMask = s.volumeLayerMask;
+                d.volumeTrigger = s.volumeTrigger != null ? s.volumeTrigger : src.transform;
+                d.stopNaN = s.stopNaN;
+                d.dithering = s.dithering;
+                d.requiresColorOption = s.requiresColorOption;
+                d.requiresDepthOption = s.requiresDepthOption;
+                var f = typeof(UnityEngine.Rendering.Universal.UniversalAdditionalCameraData).GetField("m_RendererIndex", BindingFlags.Instance | BindingFlags.NonPublic);
+                int idx = f != null ? (int)f.GetValue(s) : -1;
+                d.SetRenderer(idx);
+                dst.allowHDR = src.allowHDR;
+                dst.allowMSAA = src.allowMSAA;
+                dst.useOcclusionCulling = src.useOcclusionCulling;
+                dst.depthTextureMode = src.depthTextureMode;
+                VRModCore.Log($"[MimesisVR] URP data copied to {dst.name}: post={s.renderPostProcessing}, renderer={idx}, aa={s.antialiasing}, shadows={s.renderShadows}, volumeMask={s.volumeLayerMask.value}");
+            }
+            catch (Exception ex) { VRModCore.LogError("[MimesisVR] CopyUrpCameraData failed:", ex); }
+        }
+
         public void SetupCameraRig(Camera mainCamera)
         {
+            _hasRecenter = false;
             if (mainCamera == null)
             {
                 VRModCore.LogError("SetupCameraRig FAILED: mainCamera is null.");
@@ -515,11 +765,15 @@ namespace UnityVRMod.Features.VrVisualization
             _leftVrCameraGO.transform.SetParent(_vrRig.transform, false);
             _leftVrCamera = _leftVrCameraGO.AddComponent<Camera>();
             ConfigureVrCamera(_leftVrCamera, mainCamera, "Left");
+            CopyUrpCameraData(mainCamera, _leftVrCamera);
 
             _rightVrCameraGO = new GameObject("XrVrCamera_Right");
             _rightVrCameraGO.transform.SetParent(_vrRig.transform, false);
             _rightVrCamera = _rightVrCameraGO.AddComponent<Camera>();
             ConfigureVrCamera(_rightVrCamera, mainCamera, "Right");
+            CopyUrpCameraData(mainCamera, _rightVrCamera);
+            MimesisDiagnostics.DumpCameras(mainCamera);
+            MimesisVrExtras.Setup(_vrRig.transform);
 
             _lastCalculatedVerticalOffset = 0f;
             UpdateVerticalOffset();
@@ -553,13 +807,22 @@ namespace UnityVRMod.Features.VrVisualization
                 if (_currentlyTrackedOriginalCameraGO.TryGetComponent<Camera>(out var trackedCam)) referenceFarClip = trackedCam.farClipPlane;
             }
             vrCam.farClipPlane = referenceFarClip * _currentAppliedRigScale;
+            _refFar = vrCam.farClipPlane;
         }
+
+        private static float _refFar;
+        private static bool _gamePost = true;
 
         public void TeardownCameraRig()
         {
             VRModCore.LogRuntimeDebug("Tearing down VR camera rig.");
             if (_leftEyeIntermediateRT != null) { _leftEyeIntermediateRT.Release(); UnityEngine.Object.Destroy(_leftEyeIntermediateRT); _leftEyeIntermediateRT = null; }
             if (_rightEyeIntermediateRT != null) { _rightEyeIntermediateRT.Release(); UnityEngine.Object.Destroy(_rightEyeIntermediateRT); _rightEyeIntermediateRT = null; }
+            if (_leftFlipRT != null) { _leftFlipRT.Release(); UnityEngine.Object.Destroy(_leftFlipRT); _leftFlipRT = null; }
+            if (_rightFlipRT != null) { _rightFlipRT.Release(); UnityEngine.Object.Destroy(_rightFlipRT); _rightFlipRT = null; }
+            MimesisVrExtras.Teardown();
+            MimesisInput.VrActive = false;
+            MimesisInput.HeadValid = false;
             if (_vrRig != null) { UnityEngine.Object.Destroy(_vrRig); _vrRig = null; }
             _leftVrCameraGO = null; _leftVrCamera = null; _rightVrCameraGO = null; _rightVrCamera = null;
             _currentlyTrackedOriginalCameraGO = null;
@@ -567,12 +830,23 @@ namespace UnityVRMod.Features.VrVisualization
 
         public void TeardownVr()
         {
+            MimesisWatchdog.Armed = false;
+            RtSubmit.WaitPrevious(500);
             VRModCore.LogRuntimeDebug("Tearing down OpenXR system.");
             TeardownCameraRig();
 
             if (_pProjectionLayerViews != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayerViews); _pProjectionLayerViews = IntPtr.Zero; }
             if (_pProjectionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayer); _pProjectionLayer = IntPtr.Zero; }
             if (_pLayersForSubmit != IntPtr.Zero) { Marshal.FreeHGlobal(_pLayersForSubmit); _pLayersForSubmit = IntPtr.Zero; }
+            _panelLayer?.Dispose(); _panelLayer = null;
+            _hudLayer?.Dispose(); _hudLayer = null;
+            _laserLayer?.Dispose(); _laserLayer = null;
+            _gearLayer?.Dispose(); _gearLayer = null;
+            _fpsLayer?.Dispose(); _fpsLayer = null;
+            _watchLayer?.Dispose(); _watchLayer = null;
+            _settingsLayer?.Dispose(); _settingsLayer = null;
+            foreach (var l in _segLayers.Values) l.Dispose();
+            _segLayers.Clear();
 
             if (_appSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
                 OpenXRAPI.xrDestroySpace(_appSpace);

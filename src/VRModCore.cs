@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using UnityVRMod.Config;
 using UnityVRMod.Features.Debug;
@@ -12,7 +12,7 @@ namespace UnityVRMod.Core
     {
         public const string GUID = "com.newunitymodder.unityvrmod";
         public const string MOD_NAME = "Unity VR Mod";
-        public const string VERSION = "0.1.0";
+        public const string VERSION = "0.1.51";
         public const string AUTHOR = "New Unity Modder";
 
         public static IVRModLoader Loader { get; private set; }
@@ -28,7 +28,8 @@ namespace UnityVRMod.Core
             }
             Loader = loader;
 
-            Log($"{MOD_NAME} {VERSION} initializing...");
+            Log($"{MOD_NAME} {VERSION} (MIMESIS VR, {MvrPaths.LoaderName}) initializing...");
+            MvrPaths.PreloadNatives();
 
             ConfigManager.Init(Loader.ConfigHandler);
 
@@ -50,6 +51,7 @@ namespace UnityVRMod.Core
         static void LateInit()
         {
             LogRuntimeDebug("Executing LateInit tasks...");
+            UnityVRMod.Mimesis.MimesisBinds.CheckD3D11();
 
             if (ConfigManager.EnableVrInjection?.Value ?? false)
             {
@@ -69,6 +71,7 @@ namespace UnityVRMod.Core
                 Log("EnableVrInjection is false, skipping VR initialization.");
             }
             Log($"{MOD_NAME} {VERSION} ({Universe.Context}) fully initialized.");
+            UnityVRMod.Mimesis.MimesisInput.Install();
         }
 
         internal static void Update()
@@ -77,7 +80,8 @@ namespace UnityVRMod.Core
             {
                 VRModKeybind.Update();
                 VrVisualizationFeature?.Update();
-                TemporaryLiveReloadTester.Update();
+                if (UnityVRMod.Mimesis.MimesisSettings.DebugTools) TemporaryLiveReloadTester.Update(); // build 48: upstream live-reload keys (PageUp/PageDown, keypad, F10) only with Debug tools
+                UnityVRMod.Mimesis.MimesisSettingsUI.FlatUpdate(); // build 47: settings on the monitor without a headset
             }
             catch (Exception ex)
             {

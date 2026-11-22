@@ -1,4 +1,4 @@
-﻿using UnityVRMod.Config;
+using UnityVRMod.Config;
 using UnityVRMod.Core;
 using UnityVRMod.Features.Util;
 using UnityEngine.Events;
@@ -188,8 +188,24 @@ namespace UnityVRMod.Features.VrVisualization
             }
         }
 
+        private bool _autoStartTried;
+        private float _autoStartAt = -1f;
+
         internal void Update()
         {
+            // MIMESIS VR: try to enter VR automatically once a game camera exists (headset connected -> VR, otherwise stay flat)
+            if (!_autoStartTried && _isUserSafeModeActive && !_hasVrBeenAttemptedByUser)
+            {
+                if (_autoStartAt < 0f && CameraFinder.FindGameCamera() != null) _autoStartAt = Time.realtimeSinceStartup + 2f;
+                if (_autoStartAt > 0f && Time.realtimeSinceStartup >= _autoStartAt)
+                {
+                    _autoStartTried = true;
+                    VRModCore.Log("[MimesisVR] Auto-start: trying to enter VR (headset connected?)");
+                    ToggleUserSafeMode();
+                    if (_isUserSafeModeActive) VRModCore.Log("[MimesisVR] Auto-start: no headset/runtime available, staying in flat mode. Press F11 to retry.");
+                }
+            }
+
             if (_cameraSetup == null && _hasVrBeenAttemptedByUser)
             {
                 if (!_isUserSafeModeActive)
@@ -246,10 +262,26 @@ namespace UnityVRMod.Features.VrVisualization
                 CameraFinder.InvalidateCache();
             }
 
-            if (shouldRender && rigIsSetUp)
+            _renderPending = shouldRender && rigIsSetUp;
+
+            if (rigIsSetUp && UniverseLib.Input.InputManager.GetKeyDown(KeyCode.F10))
             {
-                _cameraSetup.UpdatePoses();
+                VRModCore.Log("Recenter requested (F10).");
+                (_cameraSetup as VrCameraSetup_CoreOpenXR)?.RequestRecenter();
             }
+            if (rigIsSetUp && UniverseLib.Input.InputManager.GetKeyDown(KeyCode.F9))
+            {
+                MimesisDiagnostics.DumpCameras(mainCam);
+            }
+        }
+
+        private bool _renderPending;
+
+        internal void EndOfFrameRender()
+        {
+            if (!_renderPending || _cameraSetup == null || !_cameraSetup.IsVrAvailable) return;
+            _renderPending = false;
+            _cameraSetup.UpdatePoses();
         }
 
         internal void Shutdown()

@@ -1,4 +1,4 @@
-﻿using BepInEx.Configuration;
+﻿using UnityVRMod.Cfg;
 using UnityVRMod.Core;
 
 namespace UnityVRMod.Config
@@ -15,7 +15,7 @@ namespace UnityVRMod.Config
 
         public override void Init()
         {
-            InternalConfigPath = Path.Combine(BepInEx.Paths.ConfigPath, $"{VRModCore.MOD_NAME}.Internal.cfg");
+            InternalConfigPath = Path.Combine(MvrPaths.ConfigDir, $"{VRModCore.MOD_NAME}.Internal.cfg");
             VRModCore.Log($"InternalConfigHandler initializing. Path: {InternalConfigPath}");
 
             try

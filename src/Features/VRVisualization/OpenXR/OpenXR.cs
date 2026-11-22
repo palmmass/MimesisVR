@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -126,7 +126,7 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
         public const int XR_MAX_ENGINE_NAME_SIZE = 128;
         public const int XR_MAX_SYSTEM_NAME_SIZE = 256;
         public const int XR_MAX_EXTENSION_NAME_SIZE = 128;
-        public static ulong XR_API_VERSION_1_1 = (1UL << 48) | (1UL << 32);
+        public static ulong XR_API_VERSION_1_1 = (1UL << 48); // MIMESIS VR: request 1.0 for VDXR compatibility
         public const string XR_KHR_D3D11_ENABLE_EXTENSION_NAME = "XR_KHR_D3D11_enable";
     }
     public static class XrBool32 { public const uint XR_FALSE = 0; public const uint XR_TRUE = 1; }
@@ -181,7 +181,7 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
 
             try
             {
-                string modAssemblyDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                string modAssemblyDir = !string.IsNullOrEmpty(UnityVRMod.Core.MvrPaths.NativeDir) ? UnityVRMod.Core.MvrPaths.NativeDir : Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
                 if (string.IsNullOrEmpty(modAssemblyDir)) throw new Exception("Failed to get mod assembly directory.");
 
                 string fullPathToLoader = Path.Combine(modAssemblyDir, "openxr_loader.dll");

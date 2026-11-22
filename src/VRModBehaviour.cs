@@ -1,4 +1,4 @@
-﻿using UnityVRMod.Config;
+using UnityVRMod.Config;
 
 #if CPP
 using Il2CppInterop.Runtime.Injection;
@@ -40,6 +40,22 @@ namespace UnityVRMod.Core
         internal void Update()
         {
             VRModCore.Update();
+        }
+
+        internal void Start()
+        {
+            StartCoroutine(EndOfFrameLoop());
+        }
+
+        private System.Collections.IEnumerator EndOfFrameLoop()
+        {
+            var wait = new WaitForEndOfFrame();
+            while (true)
+            {
+                yield return wait;
+                try { VRModCore.VrVisualizationFeature?.EndOfFrameRender(); }
+                catch (Exception ex) { VRModCore.LogError("Exception during EndOfFrameRender:", ex); }
+            }
         }
 
         internal void OnApplicationQuit()

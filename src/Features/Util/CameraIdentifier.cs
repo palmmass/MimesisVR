@@ -30,7 +30,7 @@
             if (string.IsNullOrWhiteSpace(configValue))
                 return identifiers;
 
-            string[] entries = configValue.Split([EntrySeparator], StringSplitOptions.RemoveEmptyEntries);
+            string[] entries = configValue.Split(new[] { EntrySeparator }, StringSplitOptions.RemoveEmptyEntries);
             foreach (string entry in entries)
             {
                 string[] parts = entry.Split(ScenePathSeparator);

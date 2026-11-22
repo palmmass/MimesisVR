@@ -1,0 +1,9 @@
+{
+  "name": "MIMESIS_VR",
+  "version_number": "0.1.51",
+  "website_url": "https://github.com/Palmmass/MimesisVR",
+  "description": "VR mod with motion controllers: your arms in the game, melee by swinging, wrist inventory and health. Beta, tested on Quest 3 + Virtual Desktop. OpenXR, MelonLoader.",
+  "dependencies": [
+    "LavaGang-MelonLoader-0.7.3"
+  ]
+}

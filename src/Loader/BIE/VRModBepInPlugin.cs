@@ -52,6 +52,10 @@ namespace UnityVRMod
         private void Init()
         {
             Instance = this;
+            MvrPaths.LoaderName = "BepInEx";
+            MvrPaths.ConfigDir = Paths.ConfigPath;
+            MvrPaths.DataDir = Paths.BepInExRootPath;
+            MvrPaths.NativeDir = Path.GetDirectoryName(typeof(VRModBepInPlugin).Assembly.Location);
             _configHandler = new BepInExConfigHandler();
 
             // Delegate core initialization to VRModCore

@@ -1,37 +1,18 @@
-# === Build Artifacts & Caches ===
-[Bb]in/
-[Oo]bj/
-[Rr]eleas*/
-UnityGraphicsHelper/x64/
-UnityGraphicsHelper/UnityGra.2bac508a/
-
-# === Local User Files & Scripts ===
-# IDE-specific settings
-.vs/
-*.suo
-*.user
-*.sln.docstates
-.idea/
-
-# Local test scripts (suffixed with 'L')
-*L.ps1
-
-# === Ignored Project Folders ===
-# Abridger project tool
-abridger/
-
-# Cloned OpenVR Wiki documentation
-docs/
-
-# Old and unused libraries
-lib/oldlib/
-lib/cpp/unused
-
-# === System Files ===
-Thumbs.db
-.DS_Store
-
-# === Compiled lib and debug ===
-UnityGraphicsHelper.dll
+# Game and loader assemblies: never commit (they belong to the game / loader authors)
+build/ref/
+build/ref_ml/
+# Build output
+out/
+bin/
+obj/
+*.dll
 *.pdb
-*.sig
+# Packages and logs
+*.zip
+*.log
+# Tools
+tools/harness/out/
+tools/harness/obj/
+.vs/
+.vscode/
+*.user
